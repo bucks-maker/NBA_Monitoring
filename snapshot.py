@@ -7,6 +7,7 @@ Pinnacle 라인/가격을 주기적으로 저장하고,
 
 import sqlite3
 import json
+import os
 import re
 import time
 import signal
@@ -15,11 +16,14 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import httpx
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).parent / ".env")
 
 DB_PATH = Path(__file__).parent / "data" / "snapshots.db"
 SCHEMA_PATH = Path(__file__).parent / "schema.sql"
-ODDS_API_KEY = "5700da6b9fe3d555aa4dbb4ec2d00a60"
-BOT_ADDRESS = "0x6e82b93eb57b01a63027bd0c6d2f3f04934a752c"
+ODDS_API_KEY = os.environ["ODDS_API_KEY"]
+BOT_ADDRESS = os.environ["BOT_ADDRESS"]
 
 # 타임존
 ET = ZoneInfo("America/New_York")
