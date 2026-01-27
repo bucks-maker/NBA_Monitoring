@@ -8,7 +8,10 @@
 import sqlite3
 from pathlib import Path
 from datetime import datetime, timezone
-from zoneinfo import ZoneInfo
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    from backports.zoneinfo import ZoneInfo
 
 DB_PATH = Path(__file__).parent / "data" / "snapshots.db"
 

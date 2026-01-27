@@ -4,6 +4,7 @@ Pinnacle + Polymarket NBA Total 스냅샷 수집기
 Pinnacle 라인/가격을 주기적으로 저장하고,
 변동 감지 시 Polymarket 가격과 봇 거래를 교차 기록한다.
 """
+from __future__ import annotations
 
 import sqlite3
 import json
@@ -13,7 +14,10 @@ import time
 import signal
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from zoneinfo import ZoneInfo
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    from backports.zoneinfo import ZoneInfo
 
 import httpx
 from dotenv import load_dotenv
