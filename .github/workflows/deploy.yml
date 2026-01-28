@@ -30,7 +30,7 @@ jobs:
           source: "snapshot.py,report.py,schema.sql,CLAUDE.md,ws_client.py,anomaly_detector.py"
           target: /home/ec2-user/NBA_Monitoring/
 
-      - name: Install dependencies and restart service
+      - name: Install dependencies and switch to WebSocket mode
         uses: appleboy/ssh-action@v1
         with:
           host: ${{ secrets.EC2_HOST }}
@@ -39,5 +39,9 @@ jobs:
           script: |
             cd /home/ec2-user/NBA_Monitoring
             pip3 install --user websocket-client
+
+            # systemd 서비스 파일에 --ws 플래그 추가
+            sudo sed -i 's|ExecStart=.*snapshot.py.*|ExecStart=/usr/bin/python3 /home/ec2-user/NBA_Monitoring/snapshot.py --ws|' /etc/systemd/system/nba-monitor.service
+            sudo systemctl daemon-reload
             sudo systemctl restart nba-monitor
             sudo systemctl status nba-monitor --no-pager
