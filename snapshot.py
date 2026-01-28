@@ -36,6 +36,13 @@ try:
 except ImportError:
     WS_AVAILABLE = False
 
+# Hi-Res 캡처 모듈 (선택적)
+try:
+    from hi_res_capture import HiResCapture, de_vig_implied
+    HI_RES_AVAILABLE = True
+except ImportError:
+    HI_RES_AVAILABLE = False
+
 load_dotenv(Path(__file__).parent / ".env")
 
 DB_PATH = Path(__file__).parent / "data" / "snapshots.db"
@@ -109,6 +116,17 @@ def init_db() -> sqlite3.Connection:
             conn.execute(f"ALTER TABLE triggers ADD COLUMN {col} {dtype} DEFAULT {default}")
         except Exception:
             pass
+
+    # Forward Test v2: hi-res 테이블 마이그레이션
+    # move_events_hi_res, gap_series_hi_res는 schema.sql에 정의됨
+    # 여기서는 game_mapping에 poly_line 컬럼만 추가
+    for col, dtype, default in [
+        ("poly_line", "REAL", "NULL"),
+    ]:
+        try:
+            conn.execute(f"ALTER TABLE game_mapping ADD COLUMN {col} {dtype} DEFAULT {default}")
+        except Exception:
+            pass  # 이미 존재
 
     conn.commit()
     return conn
@@ -226,6 +244,118 @@ def fetch_pinnacle(conn: sqlite3.Connection) -> list[dict]:
 
     conn.commit()
     return results
+
+
+# ── Oracle Event API (Forward Test v2) ────────────────────
+
+def fetch_oracle_event_odds(event_id: str) -> dict:
+    """
+    /events/{eventId}/odds 호출
+    markets=h2h,alternate_totals,alternate_spreads
+    bookmakers=pinnacle
+
+    Forward Test v2: 특정 이벤트의 alternate 라인까지 상세 조회
+    (크레딧 1회 소비)
+    """
+    url = f"https://api.the-odds-api.com/v4/sports/basketball_nba/events/{event_id}/odds"
+    params = {
+        "apiKey": ODDS_API_KEY,
+        "regions": "us",
+        "markets": "h2h,alternate_totals,alternate_spreads",
+        "bookmakers": "pinnacle",
+        "oddsFormat": "decimal",
+    }
+    resp = httpx.get(url, params=params, timeout=15)
+    resp.raise_for_status()
+
+    remaining = resp.headers.get("x-requests-remaining", "?")
+    print(f"  [Odds API Event] 크레딧 remaining: {remaining}")
+
+    return resp.json()
+
+
+def find_matching_line(
+    oracle_data: dict,
+    market_type: str,
+    poly_line: float,
+    outcome_name: str,
+    tolerance: float = 0.5,
+) -> tuple:
+    """
+    Oracle alternate_* 에서 poly_line과 매칭되는 라인 찾기
+
+    Args:
+        oracle_data: fetch_oracle_event_odds 응답
+        market_type: 'totals' or 'spreads'
+        poly_line: Poly 고정 라인 (예: 235.5)
+        outcome_name: 'Over', 'Under', 'Home', 'Away' 등
+        tolerance: 라인 매칭 허용 오차 (기본 0.5)
+
+    Returns:
+        (matched_line, fair_implied_prob, raw_odds) or (None, None, None)
+    """
+    market_key = f"alternate_{market_type}"  # alternate_totals, alternate_spreads
+
+    for bookmaker in oracle_data.get("bookmakers", []):
+        if bookmaker["key"] != "pinnacle":
+            continue
+
+        for market in bookmaker.get("markets", []):
+            if market["key"] != market_key:
+                continue
+
+            # 라인별로 outcomes 그룹화
+            # alternate_totals format: outcomes = [{"name": "Over", "point": 235.5, "price": 1.95}, ...]
+            outcomes_by_line = {}
+            for outcome in market.get("outcomes", []):
+                line = outcome.get("point")
+                if line is None:
+                    continue
+
+                if line not in outcomes_by_line:
+                    outcomes_by_line[line] = {}
+                outcomes_by_line[line][outcome["name"]] = outcome["price"]
+
+            # poly_line에 가장 가까운 라인 찾기
+            best_line = None
+            best_diff = float("inf")
+            for line in outcomes_by_line:
+                diff = abs(line - poly_line)
+                if diff <= tolerance and diff < best_diff:
+                    best_diff = diff
+                    best_line = line
+
+            if best_line is None:
+                continue
+
+            outcomes = outcomes_by_line[best_line]
+
+            # de-vig 계산 (Over/Under 또는 Home/Away)
+            if market_type == "totals":
+                over_odds = outcomes.get("Over", 2.0)
+                under_odds = outcomes.get("Under", 2.0)
+            else:  # spreads
+                # spreads에서 outcome name은 팀 이름
+                # 첫 번째 = home, 두 번째 = away로 가정
+                odds_list = list(outcomes.values())
+                over_odds = odds_list[0] if len(odds_list) > 0 else 2.0
+                under_odds = odds_list[1] if len(odds_list) > 1 else 2.0
+
+            # de-vig
+            if HI_RES_AVAILABLE:
+                fair_over, fair_under = de_vig_implied(over_odds, under_odds)
+            else:
+                # 단순 implied (no de-vig)
+                fair_over = 1 / over_odds if over_odds > 0 else 0.5
+                fair_under = 1 / under_odds if under_odds > 0 else 0.5
+
+            # 요청한 outcome의 implied 반환
+            if outcome_name.lower() in ("over", "home"):
+                return (best_line, fair_over, over_odds)
+            else:
+                return (best_line, fair_under, under_odds)
+
+    return (None, None, None)
 
 
 def _upsert_game_mapping(conn, game_id, home, away, commence):
@@ -413,8 +543,12 @@ def _extract_line(text: str) -> float | None:
 
 # ── 변동 감지 ─────────────────────────────────────────────
 
-def detect_moves(conn: sqlite3.Connection, current: list[dict]) -> list[dict]:
-    """직전 스냅샷과 비교해서 큰 변동 감지"""
+def detect_moves(
+    conn: sqlite3.Connection,
+    current: list[dict],
+    hi_res_capture=None,  # Forward Test v2: Optional HiResCapture instance
+) -> list[dict]:
+    """직전 스냅샷과 비교해서 큰 변동 감지 + Hi-Res 캡처"""
     triggers = []
 
     for game in current:
@@ -461,6 +595,7 @@ def detect_moves(conn: sqlite3.Connection, current: list[dict]) -> list[dict]:
 
         poly_over = poly_snap[0] if poly_snap else None
         poly_under = poly_snap[1] if poly_snap else None
+        poly_line = poly_snap[2] if poly_snap else None
         poly_gap_under = (new_under_imp - poly_under) if (new_under_imp and poly_under) else None
         poly_gap_over = (new_over_imp - poly_over) if (new_over_imp and poly_over) else None
 
@@ -479,6 +614,27 @@ def detect_moves(conn: sqlite3.Connection, current: list[dict]) -> list[dict]:
               new_line, new_over_imp, new_under_imp,
               delta_line, delta_under,
               poly_over, poly_under, poly_gap_under, poly_gap_over))
+
+        # Forward Test v2: Hi-Res 캡처 (Oracle move 트리거)
+        if hi_res_capture and HI_RES_AVAILABLE and poly_under is not None:
+            # Under 기준으로 기록 (더 큰 gap을 가진 쪽으로 변경 가능)
+            move_event_id = hi_res_capture.record_move_event(
+                game_key=game_id,
+                market_type="totals",
+                trigger_source="oracle_move",
+                oracle_prev_implied=prev_under_imp,
+                oracle_new_implied=new_under_imp,
+                poly_t0=poly_under,
+                poly_line=poly_line,
+                oracle_line=new_line,
+                outcome_name="Under",
+            )
+            if move_event_id:
+                gap_t0 = abs(new_under_imp - poly_under) if poly_under else None
+                print(f"  [HiRes Oracle] 이벤트 #{move_event_id}: gap_t0={gap_t0*100:.1f}%p" if gap_t0 else "")
+
+                # WebSocket 모드에서만 t+3s 캡처 가능 (REST에서는 실시간 가격 없음)
+                # 여기서는 t0만 기록하고, WebSocket 콜백에서 추가 캡처
 
         triggers.append({
             "game_id": game_id,
@@ -634,6 +790,128 @@ def track_gap_convergence(conn: sqlite3.Connection, pinnacle_data: list[dict]):
 
 # ── WebSocket 모드 ─────────────────────────────────────────
 
+def _handle_hi_res_capture(
+    game_id: str,
+    market_type: str,
+    event,  # AnomalyEvent
+    oracle_data: dict,
+    hi_res_capture,  # HiResCapture
+    token_to_info: dict,
+    price_tracker,  # AssetPriceTracker
+    ws_stats: dict,
+):
+    """
+    Forward Test v2: Hi-Res gap 캡처 처리
+
+    1. Poly 현재 가격 조회
+    2. Oracle alternate_* 에서 매칭 라인 찾기
+    3. move_events_hi_res 기록
+    4. t+3s, t+10s, t+30s 캡처 스케줄
+    """
+    # Anomaly 이벤트에서 outcome 추출
+    details = event.details
+    outcome = details.get("outcome", "")
+
+    # Poly 현재 가격 조회 (token_to_info에서 찾기)
+    poly_t0 = None
+    poly_line = None
+    for token_id, info in token_to_info.items():
+        if (info["game_id"] == game_id and
+            info["market_type"] == market_type):
+            # market_slug에서 라인 추출 시도
+            slug = info.get("market_slug", "")
+            if "total" in slug or "spread" in slug:
+                # slug 파싱: "nba-xxx-total-235pt5" → 235.5
+                m = re.search(r"(\d{2,3})pt(\d)", slug)
+                if m:
+                    poly_line = float(m.group(1)) + float(m.group(2)) / 10
+
+            if info["outcome"].lower() == outcome.lower():
+                poly_t0 = price_tracker.get_current_price(token_id)
+                break
+
+    if poly_t0 is None:
+        print(f"  [HiRes] Poly 가격 조회 실패, 캡처 생략")
+        return
+
+    # Oracle에서 매칭 라인 찾기
+    oracle_line = None
+    oracle_implied = None
+
+    if market_type == "moneyline":
+        # h2h는 라인 없음, 직접 implied 조회
+        for bm in oracle_data.get("bookmakers", []):
+            if bm["key"] != "pinnacle":
+                continue
+            for mkt in bm.get("markets", []):
+                if mkt["key"] != "h2h":
+                    continue
+                # h2h outcomes
+                outcomes = mkt.get("outcomes", [])
+                home_odds = away_odds = 2.0
+                for o in outcomes:
+                    if "home" in o.get("name", "").lower():
+                        home_odds = o.get("price", 2.0)
+                    else:
+                        away_odds = o.get("price", 2.0)
+
+                # de-vig
+                if HI_RES_AVAILABLE:
+                    fair_home, fair_away = de_vig_implied(home_odds, away_odds)
+                else:
+                    fair_home = 1 / home_odds if home_odds > 0 else 0.5
+                    fair_away = 1 / away_odds if away_odds > 0 else 0.5
+
+                if "home" in outcome.lower():
+                    oracle_implied = fair_home
+                else:
+                    oracle_implied = fair_away
+                break
+
+    elif market_type in ("total", "spread"):
+        # totals/spreads: alternate_* 에서 매칭 라인 찾기
+        oracle_market_type = "totals" if market_type == "total" else "spreads"
+        if poly_line:
+            matched = find_matching_line(
+                oracle_data, oracle_market_type, poly_line, outcome
+            )
+            oracle_line, oracle_implied, _ = matched
+
+    if oracle_implied is None:
+        print(f"  [HiRes] Oracle implied 조회 실패, 캡처 생략")
+        return
+
+    # move_events_hi_res 기록
+    move_event_id = hi_res_capture.record_move_event(
+        game_key=game_id,
+        market_type=market_type,
+        trigger_source="poly_anomaly",
+        oracle_prev_implied=None,  # anomaly 트리거는 prev 없음
+        oracle_new_implied=oracle_implied,
+        poly_t0=poly_t0,
+        poly_line=poly_line,
+        oracle_line=oracle_line,
+        outcome_name=outcome,
+    )
+
+    if move_event_id is None:
+        return
+
+    ws_stats["hi_res_events"] += 1
+
+    gap_t0 = abs(oracle_implied - poly_t0)
+    print(f"  [HiRes] 이벤트 #{move_event_id} 기록: gap_t0={gap_t0*100:.1f}%p")
+
+    # t+3s, t+10s, t+30s 캡처 스케줄
+    hi_res_capture.schedule_captures(
+        move_event_id=move_event_id,
+        game_key=game_id,
+        market_type=market_type,
+        outcome=outcome,
+        oracle_implied=oracle_implied,
+    )
+
+
 def fetch_market_tokens(conn: sqlite3.Connection) -> dict[str, list[dict]]:
     """
     Gamma API로 당일 NBA 마켓의 token_id(asset_id) 조회
@@ -705,7 +983,7 @@ def fetch_market_tokens(conn: sqlite3.Connection) -> dict[str, list[dict]]:
 
 
 def main_ws():
-    """WebSocket 기반 이벤트 드리븐 메인 루프"""
+    """WebSocket 기반 이벤트 드리븐 메인 루프 (Forward Test v2)"""
     global running
 
     if not WS_AVAILABLE:
@@ -717,12 +995,14 @@ def main_ws():
 
     conn = init_db()
     et_now = now_et_str()
-    print(f"Pinnacle-Polymarket NBA Monitor (WebSocket Mode)")
+    print(f"Pinnacle-Polymarket NBA Monitor (WebSocket Mode + Forward Test v2)")
     print(f"DB: {DB_PATH}")
     print(f"현재 시각: {et_now}")
     print(f"활성 시간대: ET {ACTIVE_START_HOUR:02d}:00 ~ {ACTIVE_END_HOUR:02d}:00")
     print(f"Pinnacle 호출: 이상 감지 시에만 (30분 쿨다운)")
     print(f"트리거 임계값: Δprice>=5%p (5분) | bid-ask>=5%p | Yes+No 불일치>=3%p")
+    if HI_RES_AVAILABLE:
+        print(f"Forward Test v2: Hi-Res gap 캡처 활성화 (t+3s, t+10s, t+30s)")
     print(f"{'='*60}\n")
 
     # WebSocket 클라이언트 초기화
@@ -738,11 +1018,34 @@ def main_ws():
     pinnacle_data: list[dict] = []
     pinnacle_data_lock = threading.Lock()
 
+    # Forward Test v2: Hi-Res 캡처 초기화
+    hi_res_capture = None
+    if HI_RES_AVAILABLE:
+        hi_res_capture = HiResCapture(conn)
+
+        # Poly 가격 조회 함수 설정
+        def get_poly_price(game_id: str, market_type: str, outcome: str) -> float:
+            """token_to_info를 이용해 현재 가격 조회"""
+            for token_id, info in token_to_info.items():
+                if (info["game_id"] == game_id and
+                    info["market_type"] == market_type and
+                    info["outcome"].lower() == outcome.lower()):
+                    return price_tracker.get_current_price(token_id)
+            return None
+
+        def get_poly_orderbook(game_id: str, market_type: str, outcome: str):
+            """오더북 조회 (현재는 None 반환, WebSocket book 데이터 연결 시 구현)"""
+            return (None, None, None)
+
+        hi_res_capture.set_price_getter(get_poly_price)
+        hi_res_capture.set_orderbook_getter(get_poly_orderbook)
+
     # 통계
     ws_stats = {
         "price_updates": 0,
         "anomalies_detected": 0,
         "pinnacle_calls": 0,
+        "hi_res_events": 0,
     }
 
     def on_ws_connect():
@@ -804,10 +1107,11 @@ def main_ws():
             on_anomaly_detected(event)
 
     def on_anomaly_detected(event: AnomalyEvent):
-        """이상 감지 시 Pinnacle 호출"""
+        """이상 감지 시 Pinnacle 호출 + Hi-Res 캡처 (Forward Test v2)"""
         nonlocal ws_stats, pinnacle_data
 
         game_id = event.game_id
+        market_type = event.market_type
         print(f"\n[{now_et_str()}] ** ANOMALY: {event}")
 
         # Pinnacle 호출 필요 여부 확인
@@ -820,11 +1124,15 @@ def main_ws():
 
         print(f"  [Pinnacle 호출] game_id={game_id}")
         try:
+            # Forward Test v2: Event 단위 API 호출 (alternate_* 마켓 포함)
+            oracle_data = fetch_oracle_event_odds(game_id)
+
+            # 기존 폴링 데이터도 업데이트
             with pinnacle_data_lock:
                 pinnacle_data = fetch_pinnacle(conn)
 
-            # 변동 감지
-            triggers = detect_moves(conn, pinnacle_data)
+            # 변동 감지 (hi_res_capture로 Oracle move도 캡처)
+            triggers = detect_moves(conn, pinnacle_data, hi_res_capture)
             for tr in triggers:
                 direction = "UP" if tr["delta_line"] > 0 else "DOWN"
                 gap_str = ""
@@ -833,6 +1141,13 @@ def main_ws():
                 print(f"  ** TRIGGER: {tr['away']}@{tr['home']} "
                       f"line {direction} {abs(tr['delta_line']):.1f}pt "
                       f"(now {tr['new_line']}){gap_str}")
+
+            # Forward Test v2: Hi-Res 캡처
+            if hi_res_capture and HI_RES_AVAILABLE:
+                _handle_hi_res_capture(
+                    game_id, market_type, event, oracle_data,
+                    hi_res_capture, token_to_info, price_tracker, ws_stats
+                )
 
         except Exception as e:
             print(f"  [ERROR] Pinnacle 호출 실패: {e}")
@@ -962,10 +1277,14 @@ def main_ws():
         if int(now_ts) % 300 == 0:
             ws_st = ws.get_stats()
             det_st = detector.get_stats()
+            hi_res_str = ""
+            if hi_res_capture:
+                hi_res_st = hi_res_capture.get_stats()
+                hi_res_str = f" | HiRes: {ws_stats.get('hi_res_events', 0)} events"
             print(f"[{now_et_str()}] WS: {ws_st['messages_received']} msgs, "
                   f"{ws_stats['price_updates']} prices | "
                   f"Anomalies: {ws_stats['anomalies_detected']} | "
-                  f"Pinnacle: {ws_stats['pinnacle_calls']} calls")
+                  f"Pinnacle: {ws_stats['pinnacle_calls']} calls{hi_res_str}")
 
         time.sleep(1)
 

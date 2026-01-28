@@ -74,6 +74,8 @@ monitor/
   snapshot.py            - 메인 수집기 (REST/WebSocket 모드)
   ws_client.py           - WebSocket 클라이언트
   anomaly_detector.py    - 이상 감지 엔진
+  hi_res_capture.py      - Forward Test v2: 고해상도 gap 캡처
+  hi_res_analysis.py     - Forward Test v2: 결과 분석 스크립트
   report.py              - 분석 리포트 출력
   data/
     snapshots.db         - SQLite DB
@@ -185,3 +187,46 @@ pip install websocket-client
   "asks": [{"price": "0.56", "size": "100"}]
 }
 ```
+
+## Forward Test v2: 고해상도 Gap 캡처
+
+### 목표
+"Oracle move 후 **3초 딜레이 이후에도** gap >= 4%p가 남아 **체결 가능한가**?"
+
+### 핵심 변경
+1. Totals/Spreads: `alternate_*` 마켓으로 **Poly 고정 라인과 동일 라인** 비교
+2. 측정: gap_t0, gap_t3s, gap_t10s, gap_t30s
+3. 크레딧 절약: 트리거 시에만 event 단위 호출
+
+### 새 테이블
+- `move_events_hi_res`: 고해상도 무브 이벤트 (t0~t30s gap 시계열)
+- `gap_series_hi_res`: 1초 단위 상세 gap 시계열
+
+### 실행
+```bash
+# WebSocket 모드로 실행 (Forward Test v2 자동 활성화)
+python3 snapshot.py --ws
+
+# 48시간 후 분석
+python3 hi_res_analysis.py
+```
+
+### 판정 기준
+| gap_t+3s >= 4%p 비율 | 판정 |
+|---------------------|------|
+| >= 30% | A: 유망 |
+| 10-30% | C: 약한 신호, 추가 검토 |
+| < 10% | B: 전략 불가 |
+
+### Odds API Event 엔드포인트
+```python
+# 트리거 발생 시 호출
+GET /events/{eventId}/odds
+  markets=h2h,alternate_totals,alternate_spreads
+  bookmakers=pinnacle
+```
+
+### 크레딧 계산 (48시간)
+- h2h 폴링 (60초): ~2,880
+- 트리거 호출 (~20/일): ~40
+- **총계: ~2,920** (여유 ~4,470)

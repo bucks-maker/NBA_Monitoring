@@ -93,3 +93,62 @@ CREATE INDEX IF NOT EXISTS idx_pin_game_time ON pinnacle_snapshots(game_id, snap
 CREATE INDEX IF NOT EXISTS idx_poly_game_time ON poly_snapshots(game_id, snapshot_time);
 CREATE INDEX IF NOT EXISTS idx_triggers_game ON triggers(game_id, trigger_time);
 CREATE INDEX IF NOT EXISTS idx_bot_trades_time ON bot_trades(trade_time);
+
+-- ===============================================================
+-- Forward Test v2: 고해상도 이벤트 캡처 (gap_t+3s 측정)
+-- ===============================================================
+
+-- 고해상도 무브 이벤트 (Oracle move 또는 Poly anomaly 트리거 시 기록)
+CREATE TABLE IF NOT EXISTS move_events_hi_res (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    game_key TEXT NOT NULL,               -- game_id (odds_api_id)
+    market_type TEXT NOT NULL,            -- 'h2h', 'totals', 'spreads'
+    poly_line REAL,                       -- Poly 고정 라인 (totals/spreads용)
+    oracle_line REAL,                     -- Oracle 매칭된 라인
+    move_ts_unix INTEGER NOT NULL,
+
+    -- Oracle implied (de-vigged fair probability)
+    oracle_prev_implied REAL,
+    oracle_new_implied REAL,
+    oracle_delta REAL,
+
+    -- Poly 가격 시계열
+    poly_t0 REAL,
+    poly_t3s REAL,
+    poly_t10s REAL,
+    poly_t30s REAL,
+
+    -- Gap 시계열 (|oracle_implied - poly_price|)
+    gap_t0 REAL,
+    gap_t3s REAL,
+    gap_t10s REAL,
+    gap_t30s REAL,
+
+    -- Orderbook (체결 가능성)
+    depth_t0 REAL,                        -- best bid+ask size in $
+    spread_t0 REAL,                       -- bid-ask spread
+
+    -- 메타
+    trigger_source TEXT,                  -- 'oracle_move' or 'poly_anomaly'
+    outcome_name TEXT,                    -- 'Over', 'Under', 'Home', 'Away'
+    created_at TEXT DEFAULT (datetime('now'))
+);
+
+-- 1초 단위 gap 시계열 (상세 분석용)
+CREATE TABLE IF NOT EXISTS gap_series_hi_res (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    move_event_id INTEGER REFERENCES move_events_hi_res(id),
+    ts_offset_sec INTEGER,                -- 0, 1, 2, 3, ..., 30
+    poly_price REAL,
+    gap REAL,
+    bid REAL,
+    ask REAL,
+    depth REAL
+);
+
+-- 마켓 매핑에 poly_line 추가 (Poly 고정 라인 저장)
+-- NOTE: 실제 스키마 마이그레이션은 snapshot.py init_db()에서 수행
+
+-- 인덱스
+CREATE INDEX IF NOT EXISTS idx_hi_res_game ON move_events_hi_res(game_key, move_ts_unix);
+CREATE INDEX IF NOT EXISTS idx_gap_series_event ON gap_series_hi_res(move_event_id, ts_offset_sec);
