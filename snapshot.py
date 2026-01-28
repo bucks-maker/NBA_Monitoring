@@ -77,6 +77,26 @@ def init_db() -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     with open(SCHEMA_PATH) as f:
         conn.executescript(f.read())
+
+    # 마이그레이션: poly_snapshots에 market_type 추가
+    for col, dtype, default in [
+        ("market_type", "TEXT", "'total'"),
+    ]:
+        try:
+            conn.execute(f"ALTER TABLE poly_snapshots ADD COLUMN {col} {dtype} DEFAULT {default}")
+        except Exception:
+            pass  # 이미 존재
+
+    # 마이그레이션: triggers에 market_type 추가
+    for col, dtype, default in [
+        ("market_type", "TEXT", "'totals'"),
+    ]:
+        try:
+            conn.execute(f"ALTER TABLE triggers ADD COLUMN {col} {dtype} DEFAULT {default}")
+        except Exception:
+            pass
+
+    conn.commit()
     return conn
 
 
@@ -223,8 +243,45 @@ def _upsert_game_mapping(conn, game_id, home, away, commence):
 
 # ── Polymarket ────────────────────────────────────────────
 
+def _classify_market(question: str, slug: str) -> str:
+    """Polymarket 마켓 분류: total, spread, moneyline, player_prop, other"""
+    q = question.lower()
+    s = slug.lower()
+
+    # 선수 프롭 제외
+    if any(kw in q for kw in ["points o/u", "rebounds o/u", "assists o/u",
+                                "threes o/u", "steals o/u", "blocks o/u"]):
+        return "player_prop"
+
+    # 하프/쿼터 제외
+    if any(kw in q for kw in ["1h", "1q", "2q", "3q", "4q", "first half", "first quarter"]):
+        return "other"
+
+    if "o/u" in q or "total" in s:
+        return "total"
+    if "spread" in q or "spread" in s:
+        return "spread"
+
+    # 남은 건 moneyline (팀 vs 팀)
+    if " vs" in q or " vs." in q:
+        return "moneyline"
+
+    return "other"
+
+
+def _extract_spread_line(text: str) -> float:
+    """스프레드 라인 추출: 'home-8pt5' → -8.5"""
+    m = re.search(r"(\d{1,2})pt(\d)", text)
+    if m:
+        return float(m.group(1)) + float(m.group(2)) / 10
+    m = re.search(r"(\d{1,2}\.\d)", text)
+    if m:
+        return float(m.group(1))
+    return 0.0
+
+
 def fetch_polymarket(conn: sqlite3.Connection, games: list[dict]):
-    """Pinnacle 경기 목록 기반으로 Polymarket Total 마켓 스냅샷"""
+    """Pinnacle 경기 기반 Polymarket 마켓 스냅샷 (Total + Spread + Moneyline)"""
     client = httpx.Client(timeout=15)
     snap_time = now_utc()
     found = 0
@@ -242,11 +299,15 @@ def fetch_polymarket(conn: sqlite3.Connection, games: list[dict]):
         poly_slug = row[0]
 
         # Polymarket 이벤트 조회
-        resp = client.get(
-            "https://gamma-api.polymarket.com/events",
-            params={"slug": poly_slug}
-        )
-        events = resp.json()
+        try:
+            resp = client.get(
+                "https://gamma-api.polymarket.com/events",
+                params={"slug": poly_slug}
+            )
+            events = resp.json()
+        except Exception:
+            continue
+
         if not events:
             continue
 
@@ -257,14 +318,14 @@ def fetch_polymarket(conn: sqlite3.Connection, games: list[dict]):
 
         event = events[0]
         for m in event.get("markets", []):
-            q = (m.get("question") or "").lower()
-            # 풀게임 O/U만 (선수 프롭/1H 제외)
-            is_player_prop = any(kw in q for kw in ["points o/u", "rebounds o/u", "assists o/u"])
-            if "o/u" not in q or "1h" in q or "1q" in q or is_player_prop:
+            q = m.get("question") or ""
+            market_slug = m.get("slug", "")
+            market_type = _classify_market(q, market_slug)
+
+            if market_type in ("player_prop", "other"):
                 continue
 
-            line = _extract_line(q) or _extract_line(m.get("slug", ""))
-            if line is None or not (170 <= line <= 310):
+            if m.get("closed", False):
                 continue
 
             outcomes = m.get("outcomes", [])
@@ -274,26 +335,51 @@ def fetch_polymarket(conn: sqlite3.Connection, games: list[dict]):
             if isinstance(prices, str):
                 prices = json.loads(prices)
 
-            over_price = under_price = None
+            price1 = price2 = None
             for i, name in enumerate(outcomes):
                 p = float(prices[i]) if i < len(prices) else None
                 if p is None:
                     continue
-                if "over" in name.lower():
-                    over_price = p
+                name_l = name.lower()
+                if i == 0:
+                    price1 = p
                 else:
-                    under_price = p
+                    price2 = p
 
-            market_slug = m.get("slug", "")
+            # 라인 추출
+            line = None
+            if market_type == "total":
+                line = _extract_line(q.lower()) or _extract_line(market_slug)
+                if line is not None and not (170 <= line <= 310):
+                    continue  # 선수 프롭 필터
+            elif market_type == "spread":
+                line = _extract_spread_line(market_slug)
 
-            # TODO: CLOB 오더북 (추후 추가)
+            # over/under 또는 outcome1/outcome2로 저장
+            over_price = under_price = None
+            if market_type == "total":
+                for i, name in enumerate(outcomes):
+                    p = float(prices[i]) if i < len(prices) else None
+                    if p is None:
+                        continue
+                    if "over" in name.lower():
+                        over_price = p
+                    else:
+                        under_price = p
+            else:
+                # spread/moneyline: 첫번째=home/favorite, 두번째=away/underdog
+                over_price = price1   # outcome1 price
+                under_price = price2  # outcome2 price
+
             conn.execute("""
                 INSERT OR IGNORE INTO poly_snapshots
                 (game_id, poly_market_slug, snapshot_time, total_line,
                  over_price, under_price,
-                 over_best_bid, over_best_ask, under_best_bid, under_best_ask)
-                VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL)
-            """, (game_id, market_slug, snap_time, line, over_price, under_price))
+                 over_best_bid, over_best_ask, under_best_bid, under_best_ask,
+                 market_type)
+                VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?)
+            """, (game_id, market_slug, snap_time, line,
+                  over_price, under_price, market_type))
             found += 1
 
     client.close()
@@ -350,12 +436,13 @@ def detect_moves(conn: sqlite3.Connection, current: list[dict]) -> list[dict]:
         if not trigger_type:
             continue
 
-        # 트리거 시점 Polymarket 가격 조회
+        # 트리거 시점 Polymarket 가격 조회 (가장 가까운 라인)
         poly_snap = conn.execute("""
-            SELECT over_price, under_price
+            SELECT over_price, under_price, total_line
             FROM poly_snapshots
-            WHERE game_id = ? AND total_line = ?
-            ORDER BY snapshot_time DESC LIMIT 1
+            WHERE game_id = ? AND market_type = 'total'
+            ORDER BY ABS(total_line - ?), snapshot_time DESC
+            LIMIT 1
         """, (game_id, new_line)).fetchone()
 
         poly_over = poly_snap[0] if poly_snap else None
@@ -501,12 +588,13 @@ def track_gap_convergence(conn: sqlite3.Connection, pinnacle_data: list[dict]):
     for tr in open_triggers:
         tr_id, game_id, tr_line, tr_under_imp, tr_over_imp, tr_time = tr
 
-        # 최신 Polymarket 가격 조회
+        # 최신 Polymarket 가격 조회 (가장 가까운 라인)
         poly_snap = conn.execute("""
             SELECT under_price, over_price
             FROM poly_snapshots
-            WHERE game_id = ? AND total_line = ?
-            ORDER BY snapshot_time DESC LIMIT 1
+            WHERE game_id = ? AND market_type = 'total'
+            ORDER BY ABS(total_line - ?), snapshot_time DESC
+            LIMIT 1
         """, (game_id, tr_line)).fetchone()
 
         if not poly_snap or poly_snap[0] is None:

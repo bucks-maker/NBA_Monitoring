@@ -34,9 +34,21 @@ def report():
     trigger_count = conn.execute("SELECT COUNT(*) FROM triggers").fetchone()[0]
     bot_count = conn.execute("SELECT COUNT(*) FROM bot_trades").fetchone()[0]
 
+    # Poly 마켓 타입별 카운트
+    poly_by_type = {}
+    try:
+        for row in conn.execute(
+            "SELECT COALESCE(market_type, 'total') as mt, COUNT(*) FROM poly_snapshots GROUP BY mt"
+        ).fetchall():
+            poly_by_type[row[0]] = row[1]
+    except Exception:
+        poly_by_type["total"] = poly_count
+    poly_type_str = " | ".join(f"{k}: {v}" for k, v in sorted(poly_by_type.items()))
+
     print(f"[수집 현황]")
     print(f"  경기: {game_count} | Pinnacle 스냅샷: {pin_count} | "
           f"Poly 스냅샷: {poly_count}")
+    print(f"  Poly 마켓: {poly_type_str}")
     print(f"  트리거: {trigger_count} | 봇 거래: {bot_count}")
 
     # 2. 경기 매핑 현황
@@ -119,14 +131,42 @@ def report():
 
     # 5. 봇 거래 요약
     if bot_count > 0:
-        print(f"\n[봇 거래] (최근 20건)")
+        # 마켓 타입별 집계
+        print(f"\n[봇 거래 분석]")
+        bot_slugs = conn.execute("SELECT poly_market_slug, side, size FROM bot_trades").fetchall()
+        type_stats = {"total": 0, "spread": 0, "moneyline": 0, "other": 0}
+        type_volume = {"total": 0.0, "spread": 0.0, "moneyline": 0.0, "other": 0.0}
+        for bs in bot_slugs:
+            slug = bs["poly_market_slug"] or ""
+            if "total" in slug or "o-u" in slug:
+                t = "total"
+            elif "spread" in slug:
+                t = "spread"
+            elif slug.count("-") <= 4 and "nba-" in slug:
+                t = "moneyline"
+            else:
+                t = "other"
+            type_stats[t] += 1
+            type_volume[t] += bs["size"] or 0
+
+        for t in ["total", "spread", "moneyline", "other"]:
+            if type_stats[t] > 0:
+                print(f"  {t:>10}: {type_stats[t]:>4}건  ${type_volume[t]:>12,.2f}")
+
+        print(f"\n  최근 20건:")
         bot_trades = conn.execute("""
             SELECT * FROM bot_trades ORDER BY trade_time DESC LIMIT 20
         """).fetchall()
         for bt in bot_trades:
-            print(f"  {bt['trade_time'][:19]} {bt['poly_market_slug'][:40]:<40} "
-                  f"{bt['outcome']:<10} {bt['side']:<4} "
-                  f"${bt['size']:>10,.2f} @ {bt['price']:.3f}")
+            slug = bt['poly_market_slug'] or ""
+            if "spread" in slug:
+                mtype = "[SPR]"
+            elif "total" in slug or "o-u" in slug:
+                mtype = "[TOT]"
+            else:
+                mtype = "[ML] "
+            print(f"  {bt['trade_time'][:19]} {mtype} {slug[:38]:<38} "
+                  f"{bt['side']:<4} ${bt['size']:>10,.2f} @ {bt['price']:.3f}")
 
     # 6. 가설 검증 요약
     print(f"\n{'='*70}")
