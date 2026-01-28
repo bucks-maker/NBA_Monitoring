@@ -1,8 +1,12 @@
 """
 Pinnacle + Polymarket NBA Total 스냅샷 수집기
 
-Pinnacle 라인/가격을 주기적으로 저장하고,
-변동 감지 시 Polymarket 가격과 봇 거래를 교차 기록한다.
+두 가지 모드 지원:
+1. REST 폴링 모드 (기본): Pinnacle 1시간, Polymarket 30초 주기
+2. WebSocket 모드 (--ws): Polymarket 실시간, Pinnacle 이상 감지 시에만
+
+WebSocket 모드는 Polymarket을 센서로, Pinnacle을 오라클로 사용하여
+Odds API 크레딧을 대폭 절감 (~600/월 → ~100/월)
 """
 from __future__ import annotations
 
@@ -12,6 +16,8 @@ import os
 import re
 import time
 import signal
+import sys
+import threading
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 try:
@@ -21,6 +27,14 @@ except ImportError:
 
 import httpx
 from dotenv import load_dotenv
+
+# WebSocket 모듈 (선택적)
+try:
+    from ws_client import PolyWebSocket, AssetPriceTracker
+    from anomaly_detector import AnomalyDetector, AnomalyEvent, TriggerManager
+    WS_AVAILABLE = True
+except ImportError:
+    WS_AVAILABLE = False
 
 load_dotenv(Path(__file__).parent / ".env")
 
@@ -618,12 +632,356 @@ def track_gap_convergence(conn: sqlite3.Connection, pinnacle_data: list[dict]):
     conn.commit()
 
 
+# ── WebSocket 모드 ─────────────────────────────────────────
+
+def fetch_market_tokens(conn: sqlite3.Connection) -> dict[str, list[dict]]:
+    """
+    Gamma API로 당일 NBA 마켓의 token_id(asset_id) 조회
+
+    Returns:
+        game_id → [{token_id, market_type, outcome, market_slug}, ...]
+    """
+    client = httpx.Client(timeout=15)
+    result = {}
+
+    # DB에서 poly_event_slug 목록 조회
+    rows = conn.execute("""
+        SELECT odds_api_id, poly_event_slug
+        FROM game_mapping
+        WHERE poly_event_slug IS NOT NULL AND poly_event_slug != ''
+    """).fetchall()
+
+    for game_id, poly_slug in rows:
+        try:
+            resp = client.get(
+                "https://gamma-api.polymarket.com/events",
+                params={"slug": poly_slug}
+            )
+            events = resp.json()
+        except Exception:
+            continue
+
+        if not events:
+            continue
+
+        event = events[0]
+        tokens = []
+
+        for m in event.get("markets", []):
+            q = m.get("question") or ""
+            market_slug = m.get("slug", "")
+            market_type = _classify_market(q, market_slug)
+
+            if market_type in ("player_prop", "other"):
+                continue
+            if m.get("closed", False):
+                continue
+
+            # clobTokenIds 추출
+            clob_token_ids = m.get("clobTokenIds")
+            if isinstance(clob_token_ids, str):
+                clob_token_ids = json.loads(clob_token_ids)
+            if not clob_token_ids:
+                continue
+
+            outcomes = m.get("outcomes", [])
+            if isinstance(outcomes, str):
+                outcomes = json.loads(outcomes)
+
+            for i, token_id in enumerate(clob_token_ids):
+                outcome = outcomes[i] if i < len(outcomes) else f"outcome_{i}"
+                tokens.append({
+                    "token_id": token_id,
+                    "market_type": market_type,
+                    "outcome": outcome,
+                    "market_slug": market_slug,
+                })
+
+        if tokens:
+            result[game_id] = tokens
+
+    client.close()
+    return result
+
+
+def main_ws():
+    """WebSocket 기반 이벤트 드리븐 메인 루프"""
+    global running
+
+    if not WS_AVAILABLE:
+        print("[ERROR] WebSocket 모듈 로드 실패. websocket-client 설치 필요:")
+        print("  pip install websocket-client")
+        sys.exit(1)
+
+    signal.signal(signal.SIGINT, signal_handler)
+
+    conn = init_db()
+    et_now = now_et_str()
+    print(f"Pinnacle-Polymarket NBA Monitor (WebSocket Mode)")
+    print(f"DB: {DB_PATH}")
+    print(f"현재 시각: {et_now}")
+    print(f"활성 시간대: ET {ACTIVE_START_HOUR:02d}:00 ~ {ACTIVE_END_HOUR:02d}:00")
+    print(f"Pinnacle 호출: 이상 감지 시에만 (30분 쿨다운)")
+    print(f"트리거 임계값: Δprice>=5%p (5분) | bid-ask>=5%p | Yes+No 불일치>=3%p")
+    print(f"{'='*60}\n")
+
+    # WebSocket 클라이언트 초기화
+    ws = PolyWebSocket()
+    detector = AnomalyDetector()
+    price_tracker = AssetPriceTracker(window_seconds=300)
+
+    # token_id → game_id 매핑
+    token_to_game: dict[str, str] = {}
+    token_to_info: dict[str, dict] = {}
+
+    # 마지막 Pinnacle 데이터 캐시
+    pinnacle_data: list[dict] = []
+    pinnacle_data_lock = threading.Lock()
+
+    # 통계
+    ws_stats = {
+        "price_updates": 0,
+        "anomalies_detected": 0,
+        "pinnacle_calls": 0,
+    }
+
+    def on_ws_connect():
+        print(f"[{now_et_str()}] WebSocket 연결됨")
+
+    def on_ws_disconnect():
+        print(f"[{now_et_str()}] WebSocket 연결 끊김, 재연결 시도...")
+
+    def on_ws_error(e: Exception):
+        print(f"[{now_et_str()}] WebSocket 오류: {e}")
+
+    def on_price_change(asset_id: str, data: dict):
+        """가격 변동 콜백 → 이상 감지"""
+        nonlocal ws_stats
+
+        ws_stats["price_updates"] += 1
+
+        info = token_to_info.get(asset_id)
+        if not info:
+            return
+
+        game_id = info["game_id"]
+        market_type = info["market_type"]
+        outcome = info["outcome"]
+
+        price = data.get("price")
+        if price is None:
+            return
+
+        price = float(price)
+        price_tracker.record(asset_id, price)
+
+        # 이상 감지
+        event = detector.update_price(game_id, market_type, outcome, price)
+        if event:
+            ws_stats["anomalies_detected"] += 1
+            on_anomaly_detected(event)
+
+    def on_book_update(asset_id: str, data: dict):
+        """오더북 업데이트 콜백 → 스프레드 이상 감지"""
+        info = token_to_info.get(asset_id)
+        if not info:
+            return
+
+        game_id = info["game_id"]
+        market_type = info["market_type"]
+        outcome = info["outcome"]
+
+        # 오더북에서 best bid/ask 추출
+        bids = data.get("bids", [])
+        asks = data.get("asks", [])
+
+        best_bid = float(bids[0]["price"]) if bids else 0.0
+        best_ask = float(asks[0]["price"]) if asks else 1.0
+
+        event = detector.update_orderbook(game_id, market_type, outcome, best_bid, best_ask)
+        if event:
+            ws_stats["anomalies_detected"] += 1
+            on_anomaly_detected(event)
+
+    def on_anomaly_detected(event: AnomalyEvent):
+        """이상 감지 시 Pinnacle 호출"""
+        nonlocal ws_stats, pinnacle_data
+
+        game_id = event.game_id
+        print(f"\n[{now_et_str()}] ** ANOMALY: {event}")
+
+        # Pinnacle 호출 필요 여부 확인
+        if not detector.should_call_pinnacle(game_id):
+            print(f"  (쿨다운 중, Pinnacle 호출 생략)")
+            return
+
+        detector.mark_pinnacle_called(game_id)
+        ws_stats["pinnacle_calls"] += 1
+
+        print(f"  [Pinnacle 호출] game_id={game_id}")
+        try:
+            with pinnacle_data_lock:
+                pinnacle_data = fetch_pinnacle(conn)
+
+            # 변동 감지
+            triggers = detect_moves(conn, pinnacle_data)
+            for tr in triggers:
+                direction = "UP" if tr["delta_line"] > 0 else "DOWN"
+                gap_str = ""
+                if tr["poly_gap_under"] is not None:
+                    gap_str = f" | Poly gap Under={tr['poly_gap_under']:+.1%}"
+                print(f"  ** TRIGGER: {tr['away']}@{tr['home']} "
+                      f"line {direction} {abs(tr['delta_line']):.1f}pt "
+                      f"(now {tr['new_line']}){gap_str}")
+
+        except Exception as e:
+            print(f"  [ERROR] Pinnacle 호출 실패: {e}")
+
+    def initialize_subscriptions():
+        """초기 마켓 토큰 구독"""
+        nonlocal token_to_game, token_to_info, pinnacle_data
+
+        print("[초기화] Pinnacle 데이터 수집...")
+        try:
+            with pinnacle_data_lock:
+                pinnacle_data = fetch_pinnacle(conn)
+            print(f"  {len(pinnacle_data)} games found")
+        except Exception as e:
+            print(f"  [ERROR] {e}")
+            return
+
+        print("[초기화] Polymarket 토큰 ID 수집...")
+        market_tokens = fetch_market_tokens(conn)
+
+        all_token_ids = []
+        for game_id, tokens in market_tokens.items():
+            for t in tokens:
+                token_id = t["token_id"]
+                all_token_ids.append(token_id)
+                token_to_game[token_id] = game_id
+                token_to_info[token_id] = {
+                    "game_id": game_id,
+                    "market_type": t["market_type"],
+                    "outcome": t["outcome"],
+                    "market_slug": t["market_slug"],
+                }
+
+        print(f"  {len(all_token_ids)} tokens across {len(market_tokens)} games")
+
+        if all_token_ids:
+            ws.subscribe(all_token_ids)
+            print(f"[초기화] WebSocket 구독 완료")
+
+    def refresh_subscriptions():
+        """주기적으로 새 마켓 구독 추가 (10분마다)"""
+        nonlocal token_to_game, token_to_info
+
+        market_tokens = fetch_market_tokens(conn)
+        new_tokens = []
+
+        for game_id, tokens in market_tokens.items():
+            for t in tokens:
+                token_id = t["token_id"]
+                if token_id not in token_to_game:
+                    new_tokens.append(token_id)
+                    token_to_game[token_id] = game_id
+                    token_to_info[token_id] = {
+                        "game_id": game_id,
+                        "market_type": t["market_type"],
+                        "outcome": t["outcome"],
+                        "market_slug": t["market_slug"],
+                    }
+
+        if new_tokens:
+            ws.subscribe(new_tokens)
+            print(f"[{now_et_str()}] 새 토큰 구독: {len(new_tokens)}")
+
+    # 콜백 등록
+    ws.on_connect(on_ws_connect)
+    ws.on_disconnect(on_ws_disconnect)
+    ws.on_error(on_ws_error)
+    ws.on_price_change(on_price_change)
+    ws.on_book_update(on_book_update)
+
+    # 초기화
+    initialize_subscriptions()
+
+    # WebSocket 백그라운드 실행
+    ws.run_forever(background=True)
+
+    # 주기적 작업
+    last_refresh_time = time.time()
+    last_bot_check_time = time.time()
+    REFRESH_INTERVAL = 600  # 10분마다 새 마켓 확인
+    BOT_CHECK_INTERVAL = 60  # 1분마다 봇 거래 확인
+
+    print(f"\n[{now_et_str()}] 메인 루프 시작...\n")
+
+    while running:
+        # ET 활성 시간대 체크
+        if not is_active_window():
+            wait = seconds_until_active()
+            wake_et = (now_et() + timedelta(seconds=wait)).strftime("%H:%M ET")
+            print(f"\n[SLEEP] 비활성 시간대. {wake_et}에 재개")
+            ws.stop()
+            for _ in range(wait):
+                if not running:
+                    break
+                time.sleep(1)
+            if running:
+                ws.run_forever(background=True)
+                initialize_subscriptions()
+            continue
+
+        now_ts = time.time()
+
+        # 새 마켓 구독 갱신 (10분마다)
+        if now_ts - last_refresh_time >= REFRESH_INTERVAL:
+            try:
+                refresh_subscriptions()
+            except Exception as e:
+                print(f"[WARN] 구독 갱신 실패: {e}")
+            last_refresh_time = now_ts
+
+        # 봇 거래 체크 (1분마다)
+        if now_ts - last_bot_check_time >= BOT_CHECK_INTERVAL:
+            try:
+                bot_count = check_bot_trades(conn)
+                if bot_count > 0:
+                    print(f"[{now_et_str()}] 봇 거래 {bot_count}건 기록")
+            except Exception as e:
+                print(f"[WARN] 봇 거래 체크 실패: {e}")
+            last_bot_check_time = now_ts
+
+        # 갭 수렴 추적
+        with pinnacle_data_lock:
+            if pinnacle_data:
+                track_gap_convergence(conn, pinnacle_data)
+
+        # 상태 출력 (5분마다)
+        if int(now_ts) % 300 == 0:
+            ws_st = ws.get_stats()
+            det_st = detector.get_stats()
+            print(f"[{now_et_str()}] WS: {ws_st['messages_received']} msgs, "
+                  f"{ws_stats['price_updates']} prices | "
+                  f"Anomalies: {ws_stats['anomalies_detected']} | "
+                  f"Pinnacle: {ws_stats['pinnacle_calls']} calls")
+
+        time.sleep(1)
+
+    ws.stop()
+    conn.close()
+    print("[DONE] 모니터 종료")
+
+
+# ── REST 폴링 모드 (기존) ─────────────────────────────────────
+
 def main():
     signal.signal(signal.SIGINT, signal_handler)
 
     conn = init_db()
     et_now = now_et_str()
-    print(f"Pinnacle-Polymarket NBA Monitor")
+    print(f"Pinnacle-Polymarket NBA Monitor (REST Polling Mode)")
     print(f"DB: {DB_PATH}")
     print(f"현재 시각: {et_now}")
     print(f"활성 시간대: ET {ACTIVE_START_HOUR:02d}:00 ~ {ACTIVE_END_HOUR:02d}:00")
@@ -712,4 +1070,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if "--ws" in sys.argv or "-w" in sys.argv:
+        main_ws()
+    else:
+        main()

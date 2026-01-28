@@ -27,15 +27,17 @@ jobs:
           host: ${{ secrets.EC2_HOST }}
           username: ec2-user
           key: ${{ secrets.EC2_SSH_KEY }}
-          source: "snapshot.py,report.py,schema.sql,CLAUDE.md"
+          source: "snapshot.py,report.py,schema.sql,CLAUDE.md,ws_client.py,anomaly_detector.py"
           target: /home/ec2-user/NBA_Monitoring/
 
-      - name: Restart service
+      - name: Install dependencies and restart service
         uses: appleboy/ssh-action@v1
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ec2-user
           key: ${{ secrets.EC2_SSH_KEY }}
           script: |
+            cd /home/ec2-user/NBA_Monitoring
+            pip3 install --user websocket-client
             sudo systemctl restart nba-monitor
             sudo systemctl status nba-monitor --no-pager
