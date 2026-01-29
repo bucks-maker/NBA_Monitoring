@@ -155,6 +155,10 @@ class AnomalyDetector:
         with self._lock:
             self._orderbook[key] = {"bid": best_bid, "ask": best_ask}
 
+            # 죽은/정산 마켓 필터링 (bid<=0.02, ask>=0.98 → 유동성 없음)
+            if best_bid <= 0.02 or best_ask >= 0.98:
+                return None
+
             # 3. 오더북 스프레드 이상 감지
             spread = best_ask - best_bid
             if spread >= self.spread_threshold:

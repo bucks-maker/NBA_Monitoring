@@ -93,8 +93,8 @@ def signal_handler(sig, frame):
     running = False
 
 
-def init_db() -> sqlite3.Connection:
-    conn = sqlite3.connect(str(DB_PATH))
+def init_db(thread_safe: bool = False) -> sqlite3.Connection:
+    conn = sqlite3.connect(str(DB_PATH), check_same_thread=not thread_safe)
     conn.execute("PRAGMA journal_mode=WAL")
     with open(SCHEMA_PATH) as f:
         conn.executescript(f.read())
@@ -993,7 +993,7 @@ def main_ws():
 
     signal.signal(signal.SIGINT, signal_handler)
 
-    conn = init_db()
+    conn = init_db(thread_safe=True)
     et_now = now_et_str()
     print(f"Pinnacle-Polymarket NBA Monitor (WebSocket Mode + Forward Test v2)")
     print(f"DB: {DB_PATH}")
