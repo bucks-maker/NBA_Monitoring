@@ -27,7 +27,7 @@ jobs:
           host: ${{ secrets.EC2_HOST }}
           username: ec2-user
           key: ${{ secrets.EC2_SSH_KEY }}
-          source: "snapshot.py,report.py,schema.sql,CLAUDE.md,ws_client.py,anomaly_detector.py"
+          source: "snapshot.py,report.py,schema.sql,CLAUDE.md,ws_client.py,anomaly_detector.py,hi_res_capture.py,hi_res_analysis.py"
           target: /home/ec2-user/NBA_Monitoring/
 
       - name: Install dependencies and switch to WebSocket mode

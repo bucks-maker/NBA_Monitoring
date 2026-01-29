@@ -10,7 +10,7 @@ echo "[1/3] git push..."
 git push
 
 echo "[2/3] EC2에 파일 전송..."
-scp -i "$KEY" snapshot.py report.py schema.sql CLAUDE.md "$HOST:$REMOTE_DIR/"
+scp -i "$KEY" snapshot.py report.py schema.sql CLAUDE.md ws_client.py anomaly_detector.py hi_res_capture.py hi_res_analysis.py "$HOST:$REMOTE_DIR/"
 
 echo "[3/3] 서비스 재시작..."
 ssh -i "$KEY" "$HOST" "sudo systemctl restart nba-monitor && sudo systemctl status nba-monitor --no-pager"
