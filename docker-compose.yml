@@ -1,0 +1,16 @@
+services:
+  lag-monitor:
+    build: .
+    command: python -m scripts.run_lag --ws
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
+
+  rebalance-monitor:
+    build: .
+    command: python -m scripts.run_rebalance
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
