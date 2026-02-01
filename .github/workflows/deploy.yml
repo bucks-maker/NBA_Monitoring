@@ -1,0 +1,54 @@
+name: Deploy to EC2
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'archive/**'
+      - '*.md'
+      - 'tests/**'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run tests
+        run: python -m pytest tests/ -v
+        env:
+          PYTHONPATH: .
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ec2-user
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            cd /home/ec2-user/NBA_Monitoring
+
+            # Pull latest code
+            git pull origin main
+
+            # Rebuild and restart containers
+            docker compose down
+            docker compose up -d --build
+
+            # Show status
+            docker compose ps
+
+            # Show recent logs (last 20 lines per service)
+            sleep 5
+            docker compose logs --tail=20
