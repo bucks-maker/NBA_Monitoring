@@ -30,11 +30,13 @@ from src.db.poly_repo import PolyRepo
 from src.db.triggers_repo import TriggersRepo
 from src.db.bot_trades_repo import BotTradesRepo
 from src.db.hi_res_repo import HiResRepo
+from src.db.paper_trades_repo import PaperTradesRepo
 from src.shared.nba import classify_market, extract_total_line, extract_spread_line
 from src.shared.time_utils import now_utc, now_et, now_et_str, is_active_window, seconds_until_active
 from src.shared.math_utils import de_vig_implied
 from src.strategies.lag.anomaly import AnomalyDetector, AnomalyEvent
 from src.strategies.lag.hi_res import HiResCapture
+from src.strategies.lag.paper_trading import PaperTradingEngine
 
 running = True
 
@@ -468,6 +470,10 @@ class LagMonitor:
         hi_res_capture = HiResCapture(self.hi_res_repo, self.config.hi_res)
         print(f"Forward Test v2: Hi-Res gap capture enabled (t+3s, t+10s, t+30s)")
 
+        # Paper trading setup
+        paper_repo = PaperTradesRepo(self.conn)
+        book_cache: dict[str, tuple[float, float]] = {}  # token_id -> (bid, ask)
+
         ws_stats = {"price_updates": 0, "anomalies_detected": 0, "pinnacle_calls": 0, "hi_res_events": 0}
 
         def get_poly_price(game_id, market_type, outcome):
@@ -475,6 +481,23 @@ class LagMonitor:
                 if info["game_id"] == game_id and info["market_type"] == market_type and info["outcome"].lower() == outcome.lower():
                     return price_tracker.get_current_price(token_id)
             return None
+
+        def get_poly_book(game_id, market_type, outcome):
+            for token_id, info in token_to_info.items():
+                if info["game_id"] == game_id and info["market_type"] == market_type and info["outcome"].lower() == outcome.lower():
+                    return book_cache.get(token_id, (None, None))
+            return (None, None)
+
+        paper_trading = PaperTradingEngine(
+            repo=paper_repo,
+            price_getter=get_poly_price,
+            book_getter=get_poly_book,
+            gap_threshold=0.04,
+            hold_seconds=30,
+            fee_rate=0.02,
+            max_positions=10,
+        )
+        print(f"Paper Trading: ENABLED (gap>=4%p, hold=30s, fee=2%)")
 
         hi_res_capture.set_price_getter(get_poly_price)
         hi_res_capture.set_orderbook_getter(lambda *a: (None, None, None))
@@ -502,6 +525,7 @@ class LagMonitor:
             asks = data.get("asks", [])
             best_bid = float(bids[0]["price"]) if bids else 0.0
             best_ask = float(asks[0]["price"]) if asks else 1.0
+            book_cache[asset_id] = (best_bid, best_ask)
             event = detector.update_orderbook(info["game_id"], info["market_type"], info["outcome"], best_bid, best_ask)
             if event:
                 ws_stats["anomalies_detected"] += 1
@@ -541,6 +565,19 @@ class LagMonitor:
                     game_id, event.market_type, event, oracle_data,
                     hi_res_capture, token_to_info, price_tracker, ws_stats,
                 )
+
+                # Paper trading signal (moneyline only)
+                if event.market_type == "moneyline":
+                    outcome = event.details.get("outcome", "")
+                    oracle_implied = self._get_oracle_implied(oracle_data, outcome)
+                    if oracle_implied:
+                        paper_trading.on_signal(
+                            game_id=game_id,
+                            market_type=event.market_type,
+                            outcome=outcome,
+                            oracle_implied=oracle_implied,
+                            signal_source="poly_anomaly",
+                        )
             except Exception as e:
                 print(f"  [ERROR] Pinnacle call failed: {e}")
 
@@ -645,18 +682,43 @@ class LagMonitor:
             if int(now_ts) % cfg.status_interval == 0:
                 ws_st = ws.get_stats()
                 hi_res_str = f" | HiRes: {ws_stats.get('hi_res_events', 0)} events"
+                pt_status = paper_trading.get_status()
+                pt_str = f" | Paper: {pt_status['engine_stats']['entries']} trades"
                 print(f"[{now_et_str()}] WS: {ws_st['messages_received']} msgs, "
                       f"{ws_stats['price_updates']} prices | "
                       f"Anomalies: {ws_stats['anomalies_detected']} | "
-                      f"Pinnacle: {ws_stats['pinnacle_calls']} calls{hi_res_str}")
+                      f"Pinnacle: {ws_stats['pinnacle_calls']} calls{hi_res_str}{pt_str}")
 
             time.sleep(1)
 
+        paper_trading.stop()
+        paper_trading.print_summary()
         ws.stop()
         self.conn.close()
         print("[DONE] Monitor stopped")
 
-    # ── Hi-Res capture helper ─────────────────────────────
+    # ── Helper functions ─────────────────────────────────
+
+    def _get_oracle_implied(self, oracle_data: dict, outcome: str) -> float | None:
+        """Extract oracle implied probability for moneyline outcome."""
+        for bm in oracle_data.get("bookmakers", []):
+            if bm["key"] != "pinnacle":
+                continue
+            for mkt in bm.get("markets", []):
+                if mkt["key"] != "h2h":
+                    continue
+                api_outcomes = mkt.get("outcomes", [])
+                if len(api_outcomes) < 2:
+                    return None
+                matched_idx = _match_team_name(outcome, api_outcomes)
+                if matched_idx is None:
+                    return None
+                other_idx = 1 - matched_idx
+                matched_odds = api_outcomes[matched_idx].get("price", 2.0)
+                other_odds = api_outcomes[other_idx].get("price", 2.0)
+                fair_matched, _ = de_vig_implied(matched_odds, other_odds)
+                return fair_matched
+        return None
 
     def _handle_hi_res_capture(self, game_id, market_type, event, oracle_data,
                                hi_res_capture, token_to_info, price_tracker, ws_stats):

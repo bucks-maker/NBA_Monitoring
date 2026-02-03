@@ -123,6 +123,30 @@ CREATE TABLE IF NOT EXISTS gap_series_hi_res (
     depth REAL
 );
 
+-- Paper Trading (simulated trades)
+CREATE TABLE IF NOT EXISTS paper_trades (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    game_id TEXT NOT NULL,
+    market_type TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    signal_time TEXT NOT NULL,
+    signal_source TEXT,           -- 'poly_anomaly' | 'oracle_move'
+    gap_at_signal REAL,           -- gap when signal fired
+    entry_time TEXT,
+    entry_price REAL,             -- best_ask at entry
+    entry_bid REAL,               -- best_bid at entry (for spread calc)
+    exit_time TEXT,
+    exit_price REAL,              -- best_bid at exit
+    exit_ask REAL,                -- best_ask at exit
+    hold_seconds INTEGER DEFAULT 30,
+    pnl_gross REAL,               -- (exit - entry) / entry
+    pnl_net REAL,                 -- after fees
+    slippage REAL,                -- spread cost
+    status TEXT DEFAULT 'open',   -- 'open' | 'closed' | 'cancelled'
+    notes TEXT,
+    created_at TEXT DEFAULT (datetime('now'))
+);
+
 -- Indexes
 CREATE INDEX IF NOT EXISTS idx_pin_game_time ON pinnacle_snapshots(game_id, snapshot_time);
 CREATE INDEX IF NOT EXISTS idx_poly_game_time ON poly_snapshots(game_id, snapshot_time);
@@ -130,3 +154,4 @@ CREATE INDEX IF NOT EXISTS idx_triggers_game ON triggers(game_id, trigger_time);
 CREATE INDEX IF NOT EXISTS idx_bot_trades_time ON bot_trades(trade_time);
 CREATE INDEX IF NOT EXISTS idx_hi_res_game ON move_events_hi_res(game_key, move_ts_unix);
 CREATE INDEX IF NOT EXISTS idx_gap_series_event ON gap_series_hi_res(move_event_id, ts_offset_sec);
+CREATE INDEX IF NOT EXISTS idx_paper_trades_status ON paper_trades(status, signal_time);
