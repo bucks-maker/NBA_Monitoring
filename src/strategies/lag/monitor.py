@@ -214,7 +214,8 @@ class LagMonitor:
 
     # ── Move detection ────────────────────────────────────
 
-    def detect_moves(self, current: list[dict], hi_res_capture=None) -> list[dict]:
+    def detect_moves(self, current: list[dict], hi_res_capture=None,
+                     price_getter=None) -> list[dict]:
         cfg = self.config.lag
         triggers = []
 
@@ -242,10 +243,17 @@ class LagMonitor:
             if not trigger_type:
                 continue
 
-            poly_snap = self.poly_repo.get_closest_poly_snap(game_id, new_line)
-            poly_over = poly_snap[0] if poly_snap else None
-            poly_under = poly_snap[1] if poly_snap else None
-            poly_line = poly_snap[2] if poly_snap else None
+            poly_over = poly_under = poly_line = None
+            if price_getter:
+                poly_over = price_getter(game_id, "total", "Over")
+                poly_under = price_getter(game_id, "total", "Under")
+                if poly_over is not None or poly_under is not None:
+                    poly_line = new_line
+            if poly_over is None and poly_under is None:
+                poly_snap = self.poly_repo.get_closest_poly_snap(game_id, new_line)
+                poly_over = poly_snap[0] if poly_snap else None
+                poly_under = poly_snap[1] if poly_snap else None
+                poly_line = poly_snap[2] if poly_snap else None
             poly_gap_under = (new_under_imp - poly_under) if (new_under_imp and poly_under) else None
             poly_gap_over = (new_over_imp - poly_over) if (new_over_imp and poly_over) else None
 
@@ -517,7 +525,8 @@ class LagMonitor:
                 with self.pinnacle_data_lock:
                     self.pinnacle_data = self.fetch_pinnacle()
 
-                triggers = self.detect_moves(self.pinnacle_data, hi_res_capture)
+                triggers = self.detect_moves(self.pinnacle_data, hi_res_capture,
+                                             price_getter=get_poly_price)
                 for tr in triggers:
                     direction = "UP" if tr["delta_line"] > 0 else "DOWN"
                     gap_str = ""
