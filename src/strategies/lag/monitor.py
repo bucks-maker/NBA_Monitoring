@@ -531,9 +531,25 @@ class LagMonitor:
                 ws_stats["anomalies_detected"] += 1
                 on_anomaly(event)
 
+        # Cache for oracle implied (for paper trading without Pinnacle call)
+        oracle_cache: dict[str, dict[str, float]] = {}  # game_id -> {outcome: implied}
+
         def on_anomaly(event):
             game_id = event.game_id
             print(f"\n[{now_et_str()}] ** ANOMALY: {event}")
+
+            # Paper trading can use cached oracle data (separate from Pinnacle cooldown)
+            if event.market_type == "moneyline":
+                outcome = event.details.get("outcome", "")
+                cached_implied = oracle_cache.get(game_id, {}).get(outcome)
+                if cached_implied:
+                    paper_trading.on_signal(
+                        game_id=game_id,
+                        market_type=event.market_type,
+                        outcome=outcome,
+                        oracle_implied=cached_implied,
+                        signal_source="poly_anomaly_cached",
+                    )
 
             if not detector.should_call_pinnacle(game_id):
                 print(f"  (cooldown, skipping Pinnacle)")
@@ -566,11 +582,14 @@ class LagMonitor:
                     hi_res_capture, token_to_info, price_tracker, ws_stats,
                 )
 
-                # Paper trading signal (moneyline only)
+                # Update oracle cache and trigger paper trading
                 if event.market_type == "moneyline":
                     outcome = event.details.get("outcome", "")
                     oracle_implied = self._get_oracle_implied(oracle_data, outcome)
                     if oracle_implied:
+                        if game_id not in oracle_cache:
+                            oracle_cache[game_id] = {}
+                        oracle_cache[game_id][outcome] = oracle_implied
                         paper_trading.on_signal(
                             game_id=game_id,
                             market_type=event.market_type,
