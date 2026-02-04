@@ -550,6 +550,8 @@ class LagMonitor:
                         oracle_implied=cached_implied,
                         signal_source="poly_anomaly_cached",
                     )
+                elif game_id not in oracle_cache:
+                    print(f"  [Paper] game_id {game_id[:8]}... not in oracle_cache")
 
             if not detector.should_call_pinnacle(game_id):
                 print(f"  (cooldown, skipping Pinnacle)")

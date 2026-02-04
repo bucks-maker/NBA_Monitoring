@@ -1,0 +1,47 @@
+name: Deploy to EC2
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy to EC2
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ec2-user
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            cd /home/ec2-user/NBA_Monitoring
+            # 파일 업데이트
+            sudo systemctl stop nba-monitor
+
+      - name: Copy files to EC2
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ec2-user
+          key: ${{ secrets.EC2_SSH_KEY }}
+          source: "snapshot.py,report.py,schema.sql,CLAUDE.md,ws_client.py,anomaly_detector.py,hi_res_capture.py,hi_res_analysis.py"
+          target: /home/ec2-user/NBA_Monitoring/
+
+      - name: Install dependencies and switch to WebSocket mode
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ec2-user
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            cd /home/ec2-user/NBA_Monitoring
+            pip3 install --user websocket-client
+
+            # systemd 서비스 파일에 --ws 플래그 추가
+            sudo sed -i 's|ExecStart=.*snapshot.py.*|ExecStart=/usr/bin/python3 /home/ec2-user/NBA_Monitoring/snapshot.py --ws|' /etc/systemd/system/nba-monitor.service
+            sudo systemctl daemon-reload
+            sudo systemctl restart nba-monitor
+            sudo systemctl status nba-monitor --no-pager
