@@ -118,6 +118,7 @@ class PaperTradingEngine:
             # Fallback to price
             price = self.price_getter(game_id, market_type, outcome)
             if price is None:
+                print(f"  [Paper] SKIP {outcome}: no price")
                 return None
             bid = price - 0.01
             ask = price + 0.01
@@ -127,11 +128,13 @@ class PaperTradingEngine:
 
         # Check gap threshold
         if gap < self.gap_threshold:
+            print(f"  [Paper] SKIP {outcome}: gap {gap*100:.1f}%p < 4%p (oracle={oracle_implied:.2f}, ask={ask:.2f})")
             return None
 
         # Check price range (realistic execution)
         if not (0.15 <= ask <= 0.85):
             self.stats["skipped"] += 1
+            print(f"  [Paper] SKIP {outcome}: price {ask:.2f} out of range")
             return None
 
         # Open position
