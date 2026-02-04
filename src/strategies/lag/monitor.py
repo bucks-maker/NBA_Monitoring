@@ -611,6 +611,35 @@ class LagMonitor:
                 print(f"  [ERROR] {e}")
                 return
 
+            # Pre-load h2h oracle data for paper trading
+            print("[Init] Fetching h2h oracle data for paper trading...")
+            try:
+                h2h_games, _ = self.odds_client.get_odds(markets="h2h")
+                h2h_count = 0
+                for game in h2h_games:
+                    game_id = game["id"]
+                    for bm in game.get("bookmakers", []):
+                        if bm["key"] != "pinnacle":
+                            continue
+                        for mkt in bm.get("markets", []):
+                            if mkt["key"] != "h2h":
+                                continue
+                            outcomes = mkt.get("outcomes", [])
+                            if len(outcomes) < 2:
+                                continue
+                            if game_id not in oracle_cache:
+                                oracle_cache[game_id] = {}
+                            for oc in outcomes:
+                                name = oc.get("name", "")
+                                odds = oc.get("price", 2.0)
+                                other_odds = outcomes[1]["price"] if oc == outcomes[0] else outcomes[0]["price"]
+                                fair, _ = de_vig_implied(odds, other_odds)
+                                oracle_cache[game_id][name] = fair
+                                h2h_count += 1
+                print(f"  {h2h_count} h2h outcomes cached for {len(oracle_cache)} games")
+            except Exception as e:
+                print(f"  [WARN] h2h fetch failed: {e}")
+
             print("[Init] Fetching Polymarket token IDs...")
             market_tokens = self.fetch_market_tokens()
             all_token_ids = []
