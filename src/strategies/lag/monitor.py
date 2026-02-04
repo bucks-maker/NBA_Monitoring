@@ -664,13 +664,24 @@ class LagMonitor:
                 print(f"  [ERROR] {e}")
                 return
 
-            # Pre-load h2h oracle data for paper trading
+            # Pre-load h2h oracle data for paper trading AND add to game_mapping
             print("[Init] Fetching h2h oracle data for paper trading...")
             try:
                 h2h_games, _ = self.odds_client.get_odds(markets="h2h")
                 h2h_count = 0
+                h2h_games_added = 0
                 for game in h2h_games:
                     game_id = game["id"]
+                    home = game.get("home_team", "")
+                    away = game.get("away_team", "")
+                    commence = game.get("commence_time", "")
+
+                    # CRITICAL: Also add h2h games to game_mapping for token subscription!
+                    existing_slug = self.game_repo.get_slug(game_id)
+                    if not existing_slug:
+                        self.game_repo.upsert(game_id, home, away, commence)
+                        h2h_games_added += 1
+
                     for bm in game.get("bookmakers", []):
                         if bm["key"] != "pinnacle":
                             continue
@@ -689,7 +700,10 @@ class LagMonitor:
                                 fair, _ = de_vig_implied(odds, other_odds)
                                 oracle_cache[game_id][name] = fair
                                 h2h_count += 1
+                self.game_repo.commit()
                 print(f"  {h2h_count} h2h outcomes cached for {len(oracle_cache)} games")
+                if h2h_games_added > 0:
+                    print(f"  {h2h_games_added} new h2h games added to game_mapping")
             except Exception as e:
                 print(f"  [WARN] h2h fetch failed: {e}")
 
