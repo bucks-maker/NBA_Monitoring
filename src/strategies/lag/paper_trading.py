@@ -37,6 +37,8 @@ class PaperTradingEngine:
         repo: PaperTradesRepo,
         price_getter: Callable[[str, str, str], Optional[float]],
         book_getter: Callable[[str, str, str], tuple[Optional[float], Optional[float]]],
+        token_price_getter: Optional[Callable[[str], Optional[float]]] = None,
+        token_book_getter: Optional[Callable[[str], tuple[Optional[float], Optional[float]]]] = None,
         gap_threshold: float = 0.04,
         hold_seconds: int = 30,
         fee_rate: float = 0.02,
@@ -48,6 +50,8 @@ class PaperTradingEngine:
             repo: Database repository for paper trades
             price_getter: (game_id, market_type, outcome) -> price
             book_getter: (game_id, market_type, outcome) -> (bid, ask)
+            token_price_getter: (token_id) -> price (direct lookup)
+            token_book_getter: (token_id) -> (bid, ask) (direct lookup)
             gap_threshold: Minimum gap to enter (default 4%p)
             hold_seconds: Seconds to hold position (default 30)
             fee_rate: Fee rate to deduct from PnL (default 2%)
@@ -57,6 +61,8 @@ class PaperTradingEngine:
         self.repo = repo
         self.price_getter = price_getter
         self.book_getter = book_getter
+        self.token_price_getter = token_price_getter
+        self.token_book_getter = token_book_getter
         self.gap_threshold = gap_threshold
         self.hold_seconds = hold_seconds
         self.fee_rate = fee_rate
@@ -79,6 +85,7 @@ class PaperTradingEngine:
         outcome: str,
         oracle_implied: float,
         signal_source: str = "poly_anomaly",
+        token_id: Optional[str] = None,
     ) -> Optional[int]:
         """
         Handle a trading signal. Enter position if conditions met.
@@ -89,6 +96,7 @@ class PaperTradingEngine:
             outcome: Outcome name (e.g., 'Lakers', 'Over')
             oracle_implied: Oracle's implied probability
             signal_source: Signal source for tracking
+            token_id: Optional token ID for direct price lookup
 
         Returns:
             trade_id if position opened, None otherwise
@@ -113,28 +121,52 @@ class PaperTradingEngine:
                 return None
 
         # Get current price and orderbook
-        bid, ask = self.book_getter(game_id, market_type, outcome)
+        bid, ask = None, None
+        book_source = "none"
+
+        # Try direct token lookup first if token_id provided
+        if token_id:
+            if self.token_book_getter:
+                bid, ask = self.token_book_getter(token_id)
+                if bid is not None and ask is not None:
+                    book_source = "token_book"
+            if bid is None or ask is None:
+                if self.token_price_getter:
+                    price = self.token_price_getter(token_id)
+                    if price is not None:
+                        bid = price - 0.01
+                        ask = price + 0.01
+                        book_source = "token_price"
+
+        # Fallback to game/market/outcome lookup
         if bid is None or ask is None:
-            # Fallback to price
+            bid, ask = self.book_getter(game_id, market_type, outcome)
+            if bid is not None and ask is not None:
+                book_source = "book"
+
+        if bid is None or ask is None:
             price = self.price_getter(game_id, market_type, outcome)
             if price is None:
-                print(f"  [Paper] SKIP {outcome}: no price")
+                print(f"  [Paper] SKIP {outcome}: no price (game_id={game_id[:8]}...)")
                 return None
             bid = price - 0.01
             ask = price + 0.01
+            book_source = "price"
 
         # Calculate gap
         gap = abs(oracle_implied - ask) if oracle_implied else 0
 
         # Check gap threshold
         if gap < self.gap_threshold:
-            print(f"  [Paper] SKIP {outcome}: gap {gap*100:.1f}%p < 4%p (oracle={oracle_implied:.2f}, ask={ask:.2f})")
+            print(f"  [Paper] SKIP {outcome}: gap {gap*100:.1f}%p < 4%p "
+                  f"(oracle={oracle_implied:.2f}, ask={ask:.2f}, src={book_source})")
             return None
 
         # Check price range (realistic execution)
         if not (0.15 <= ask <= 0.85):
             self.stats["skipped"] += 1
-            print(f"  [Paper] SKIP {outcome}: price {ask:.2f} out of range")
+            print(f"  [Paper] SKIP {outcome}: ask={ask:.2f} out of [0.15,0.85] "
+                  f"(oracle={oracle_implied:.2f}, gap={gap*100:.1f}%p, src={book_source})")
             return None
 
         # Open position

@@ -479,7 +479,11 @@ class LagMonitor:
         def get_poly_price(game_id, market_type, outcome):
             for token_id, info in token_to_info.items():
                 if info["game_id"] == game_id and info["market_type"] == market_type and info["outcome"].lower() == outcome.lower():
-                    return price_tracker.get_current_price(token_id)
+                    price = price_tracker.get_current_price(token_id)
+                    # Debug: log if price seems extreme
+                    if price is not None and (price < 0.10 or price > 0.90):
+                        print(f"  [Debug] get_poly_price: {outcome}@{game_id[:8]} = {price:.3f} (token={token_id[:8]})")
+                    return price
             return None
 
         def get_poly_book(game_id, market_type, outcome):
@@ -488,10 +492,20 @@ class LagMonitor:
                     return book_cache.get(token_id, (None, None))
             return (None, None)
 
+        def get_token_price(token_id):
+            """Direct price lookup by token_id."""
+            return price_tracker.get_current_price(token_id)
+
+        def get_token_book(token_id):
+            """Direct book lookup by token_id."""
+            return book_cache.get(token_id, (None, None))
+
         paper_trading = PaperTradingEngine(
             repo=paper_repo,
             price_getter=get_poly_price,
             book_getter=get_poly_book,
+            token_price_getter=get_token_price,
+            token_book_getter=get_token_book,
             gap_threshold=0.04,
             hold_seconds=30,
             fee_rate=0.02,
@@ -514,6 +528,9 @@ class LagMonitor:
             price_tracker.record(asset_id, price)
             event = detector.update_price(info["game_id"], info["market_type"], info["outcome"], price)
             if event:
+                # Add token_id to event details for precise price lookup
+                event.details["token_id"] = asset_id
+                event.details["current_price"] = price
                 ws_stats["anomalies_detected"] += 1
                 on_anomaly(event)
 
@@ -534,6 +551,29 @@ class LagMonitor:
         # Cache for oracle implied (for paper trading without Pinnacle call)
         oracle_cache: dict[str, dict[str, float]] = {}  # game_id -> {outcome: implied}
 
+        def get_cached_oracle_implied(game_id: str, outcome: str) -> float | None:
+            """Lookup oracle implied with fuzzy team name matching."""
+            game_data = oracle_cache.get(game_id)
+            if not game_data:
+                return None
+            # Direct match first
+            if outcome in game_data:
+                return game_data[outcome]
+            # Fuzzy match using _match_team_name logic
+            outcome_lower = outcome.lower().strip()
+            outcome_words = outcome_lower.split()
+            outcome_last = outcome_words[-1] if outcome_words else ""
+            for cached_name, implied in game_data.items():
+                cached_lower = cached_name.lower().strip()
+                # Partial match
+                if outcome_lower in cached_lower or cached_lower in outcome_lower:
+                    return implied
+                # Last word match (e.g., "Trail Blazers" matches "Portland Trail Blazers")
+                cached_words = cached_lower.split()
+                if cached_words and outcome_last and cached_words[-1] == outcome_last:
+                    return implied
+            return None
+
         def on_anomaly(event):
             game_id = event.game_id
             print(f"\n[{now_et_str()}] ** ANOMALY: {event}")
@@ -541,17 +581,26 @@ class LagMonitor:
             # Paper trading can use cached oracle data (separate from Pinnacle cooldown)
             if event.market_type == "moneyline":
                 outcome = event.details.get("outcome", "")
-                cached_implied = oracle_cache.get(game_id, {}).get(outcome)
+                token_id = event.details.get("token_id")
+                current_price = event.details.get("current_price")
+                cached_implied = get_cached_oracle_implied(game_id, outcome)
                 if cached_implied:
+                    # Log the signal attempt with price from anomaly event
+                    print(f"  [Paper] Signal: {outcome} oracle={cached_implied:.2f}, poly_price={current_price:.3f}")
                     paper_trading.on_signal(
                         game_id=game_id,
                         market_type=event.market_type,
                         outcome=outcome,
                         oracle_implied=cached_implied,
                         signal_source="poly_anomaly_cached",
+                        token_id=token_id,  # Pass token_id for direct lookup
                     )
                 elif game_id not in oracle_cache:
-                    print(f"  [Paper] game_id {game_id[:8]}... not in oracle_cache")
+                    print(f"  [Paper] game_id {game_id[:8]}... not in oracle_cache ({len(oracle_cache)} games cached)")
+                else:
+                    # game_id exists but outcome not found (even with fuzzy match)
+                    cached_names = list(oracle_cache[game_id].keys())
+                    print(f"  [Paper] outcome '{outcome}' not matched in cache (have: {cached_names})")
 
             if not detector.should_call_pinnacle(game_id):
                 print(f"  (cooldown, skipping Pinnacle)")
@@ -587,6 +636,7 @@ class LagMonitor:
                 # Update oracle cache and trigger paper trading
                 if event.market_type == "moneyline":
                     outcome = event.details.get("outcome", "")
+                    token_id = event.details.get("token_id")
                     oracle_implied = self._get_oracle_implied(oracle_data, outcome)
                     if oracle_implied:
                         if game_id not in oracle_cache:
@@ -598,6 +648,7 @@ class LagMonitor:
                             outcome=outcome,
                             oracle_implied=oracle_implied,
                             signal_source="poly_anomaly",
+                            token_id=token_id,
                         )
             except Exception as e:
                 print(f"  [ERROR] Pinnacle call failed: {e}")
