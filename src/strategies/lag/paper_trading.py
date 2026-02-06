@@ -120,23 +120,26 @@ class PaperTradingEngine:
                 self.stats["skipped"] += 1
                 return None
 
-        # Get current price and orderbook
+        # Get current price first (most reliable)
+        current_price = None
+        if token_id and self.token_price_getter:
+            current_price = self.token_price_getter(token_id)
+        if current_price is None:
+            current_price = self.price_getter(game_id, market_type, outcome)
+
+        if current_price is None:
+            print(f"  [Paper] SKIP {outcome}: no price (game_id={game_id[:8]}...)")
+            return None
+
+        # Try to get orderbook data
         bid, ask = None, None
         book_source = "none"
 
         # Try direct token lookup first if token_id provided
-        if token_id:
-            if self.token_book_getter:
-                bid, ask = self.token_book_getter(token_id)
-                if bid is not None and ask is not None:
-                    book_source = "token_book"
-            if bid is None or ask is None:
-                if self.token_price_getter:
-                    price = self.token_price_getter(token_id)
-                    if price is not None:
-                        bid = price - 0.01
-                        ask = price + 0.01
-                        book_source = "token_price"
+        if token_id and self.token_book_getter:
+            bid, ask = self.token_book_getter(token_id)
+            if bid is not None and ask is not None:
+                book_source = "token_book"
 
         # Fallback to game/market/outcome lookup
         if bid is None or ask is None:
@@ -144,13 +147,19 @@ class PaperTradingEngine:
             if bid is not None and ask is not None:
                 book_source = "book"
 
+        # Sanity check: book data should be close to current price
+        # If book ask is too far from price (>20%), use price instead
+        if bid is not None and ask is not None:
+            if abs(ask - current_price) > 0.20:
+                # Book data seems stale/wrong, use price
+                bid = current_price - 0.01
+                ask = current_price + 0.01
+                book_source = "price_fallback"
+
+        # Final fallback to price
         if bid is None or ask is None:
-            price = self.price_getter(game_id, market_type, outcome)
-            if price is None:
-                print(f"  [Paper] SKIP {outcome}: no price (game_id={game_id[:8]}...)")
-                return None
-            bid = price - 0.01
-            ask = price + 0.01
+            bid = current_price - 0.01
+            ask = current_price + 0.01
             book_source = "price"
 
         # Calculate gap
