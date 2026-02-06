@@ -50,6 +50,6 @@ jobs:
             # Show status
             sudo docker compose ps
 
-            # Show recent logs (last 20 lines per service)
-            sleep 5
-            sudo docker compose logs --tail=20
+            # Show recent logs (last 50 lines per service)
+            sleep 10
+            sudo docker compose logs --tail=50
