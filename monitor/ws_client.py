@@ -257,7 +257,18 @@ class PolyWebSocket:
         except json.JSONDecodeError:
             return
 
-        # 메시지 타입별 처리
+        # Polymarket WS can send arrays of events
+        if isinstance(data, list):
+            for item in data:
+                if isinstance(item, dict):
+                    self._dispatch(item)
+            return
+
+        if isinstance(data, dict):
+            self._dispatch(data)
+
+    def _dispatch(self, data: dict):
+        """단일 메시지 타입별 처리"""
         # 문서: https://docs.polymarket.com/developers/CLOB/websocket/market-channel
         event_type = data.get("event_type") or data.get("type")
 
