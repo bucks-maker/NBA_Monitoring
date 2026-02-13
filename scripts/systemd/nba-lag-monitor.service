@@ -1,0 +1,19 @@
+[Unit]
+Description=NBA Pinnacle-Polymarket Lag Monitor (WebSocket)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ec2-user
+WorkingDirectory=/home/ec2-user/NBA_Monitoring
+EnvironmentFile=/home/ec2-user/NBA_Monitoring/.env
+ExecStart=/home/ec2-user/NBA_Monitoring/venv/bin/python -m scripts.run_lag --ws
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=nba-lag-monitor
+
+[Install]
+WantedBy=multi-user.target
