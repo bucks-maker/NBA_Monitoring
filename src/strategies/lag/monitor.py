@@ -557,15 +557,31 @@ class LagMonitor:
 
         # Cache for oracle implied (for paper trading without Pinnacle call)
         oracle_cache: dict[str, dict[str, float]] = {}  # game_id -> {outcome: implied}
+        oracle_cache_ts: dict[str, float] = {}  # game_id -> last_updated unix timestamp
+        ORACLE_MAX_AGE = 300  # 5 minutes — stale cache not used for paper trading
 
-        def get_cached_oracle_implied(game_id: str, outcome: str) -> float | None:
-            """Lookup oracle implied with fuzzy team name matching."""
+        def update_oracle_cache(game_id: str, outcome: str, implied: float):
+            """Update oracle cache with timestamp tracking."""
+            if game_id not in oracle_cache:
+                oracle_cache[game_id] = {}
+            oracle_cache[game_id][outcome] = implied
+            oracle_cache_ts[game_id] = time.time()
+
+        def get_cached_oracle_implied(game_id: str, outcome: str) -> tuple[float | None, bool]:
+            """Lookup oracle implied with fuzzy team name matching.
+
+            Returns (implied, is_fresh) where is_fresh=True if data is within ORACLE_MAX_AGE.
+            """
             game_data = oracle_cache.get(game_id)
             if not game_data:
-                return None
+                return None, False
+
+            cache_age = time.time() - oracle_cache_ts.get(game_id, 0)
+            is_fresh = cache_age <= ORACLE_MAX_AGE
+
             # Direct match first
             if outcome in game_data:
-                return game_data[outcome]
+                return game_data[outcome], is_fresh
             # Fuzzy match using _match_team_name logic
             outcome_lower = outcome.lower().strip()
             outcome_words = outcome_lower.split()
@@ -574,38 +590,39 @@ class LagMonitor:
                 cached_lower = cached_name.lower().strip()
                 # Partial match
                 if outcome_lower in cached_lower or cached_lower in outcome_lower:
-                    return implied
+                    return implied, is_fresh
                 # Last word match (e.g., "Trail Blazers" matches "Portland Trail Blazers")
                 cached_words = cached_lower.split()
                 if cached_words and outcome_last and cached_words[-1] == outcome_last:
-                    return implied
-            return None
+                    return implied, is_fresh
+            return None, False
 
         def on_anomaly(event):
             game_id = event.game_id
             print(f"\n[{now_et_str()}] ** ANOMALY: {event}")
 
-            # Paper trading can use cached oracle data (separate from Pinnacle cooldown)
+            # Paper trading: only use FRESH oracle data (< 5 min old)
             if event.market_type == "moneyline":
                 outcome = event.details.get("outcome", "")
                 token_id = event.details.get("token_id")
                 current_price = event.details.get("current_price")
-                cached_implied = get_cached_oracle_implied(game_id, outcome)
-                if cached_implied:
-                    # Log the signal attempt with price from anomaly event
-                    print(f"  [Paper] Signal: {outcome} oracle={cached_implied:.2f}, poly_price={current_price:.3f}")
+                cached_implied, is_fresh = get_cached_oracle_implied(game_id, outcome)
+                if cached_implied and is_fresh:
+                    print(f"  [Paper] Signal: {outcome} oracle={cached_implied:.2f}, poly_price={current_price:.3f} (fresh)")
                     paper_trading.on_signal(
                         game_id=game_id,
                         market_type=event.market_type,
                         outcome=outcome,
                         oracle_implied=cached_implied,
                         signal_source="poly_anomaly_cached",
-                        token_id=token_id,  # Pass token_id for direct lookup
+                        token_id=token_id,
                     )
+                elif cached_implied and not is_fresh:
+                    age = int(time.time() - oracle_cache_ts.get(game_id, 0))
+                    print(f"  [Paper] SKIP {outcome}: oracle stale ({age}s old > {ORACLE_MAX_AGE}s)")
                 elif game_id not in oracle_cache:
                     print(f"  [Paper] game_id {game_id[:8]}... not in oracle_cache ({len(oracle_cache)} games cached)")
                 else:
-                    # game_id exists but outcome not found (even with fuzzy match)
                     cached_names = list(oracle_cache[game_id].keys())
                     print(f"  [Paper] outcome '{outcome}' not matched in cache (have: {cached_names})")
 
@@ -640,15 +657,13 @@ class LagMonitor:
                     hi_res_capture, token_to_info, price_tracker, ws_stats,
                 )
 
-                # Update oracle cache and trigger paper trading
+                # Update oracle cache with fresh data and trigger paper trading
                 if event.market_type == "moneyline":
                     outcome = event.details.get("outcome", "")
                     token_id = event.details.get("token_id")
                     oracle_implied = self._get_oracle_implied(oracle_data, outcome)
                     if oracle_implied:
-                        if game_id not in oracle_cache:
-                            oracle_cache[game_id] = {}
-                        oracle_cache[game_id][outcome] = oracle_implied
+                        update_oracle_cache(game_id, outcome, oracle_implied)
                         paper_trading.on_signal(
                             game_id=game_id,
                             market_type=event.market_type,
@@ -710,14 +725,12 @@ class LagMonitor:
                             outcomes = mkt.get("outcomes", [])
                             if len(outcomes) < 2:
                                 continue
-                            if game_id not in oracle_cache:
-                                oracle_cache[game_id] = {}
                             for oc in outcomes:
                                 name = oc.get("name", "")
                                 odds = oc.get("price", 2.0)
                                 other_odds = outcomes[1]["price"] if oc == outcomes[0] else outcomes[0]["price"]
                                 fair, _ = de_vig_implied(odds, other_odds)
-                                oracle_cache[game_id][name] = fair
+                                update_oracle_cache(game_id, name, fair)
                                 h2h_count += 1
                 self.game_repo.commit()
                 print(f"  {h2h_count} h2h outcomes cached for {len(oracle_cache)} games")
