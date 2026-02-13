@@ -45,7 +45,6 @@ htmlcov/
 # Data directories (runtime data)
 out/
 data/
-monitor/data/
 *.csv
 *.parquet
 *.jsonl

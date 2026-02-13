@@ -59,24 +59,24 @@ Over half of oracle moves still show 4%p+ gap after 3 seconds -- execution is th
 
 ```
 .
-├── monitor/                    # Core monitoring system (runs on EC2)
-│   ├── snapshot.py             # Main collector (REST / WebSocket modes)
-│   ├── ws_client.py            # Polymarket CLOB WebSocket client
-│   ├── anomaly_detector.py     # Anomaly detection engine
-│   ├── rebalance_monitor.py    # Multi-outcome rebalance scanner
-│   ├── rebalance_tracker.py    # Rebalance tracking logic
-│   ├── hi_res_capture.py       # Forward Test v2: hi-res gap capture
-│   ├── hi_res_analysis.py      # Forward Test v2: gap analysis
-│   ├── report.py               # Analysis report generator
-│   ├── schema.sql              # SQLite schema
-│   └── backtest/               # Historical backtesting scripts
-├── src/                        # Modular library (clients, DB repos, strategies)
+├── src/                        # Core library
 │   ├── clients/                # API clients (CLOB, Gamma, Odds, WS)
 │   ├── db/                     # SQLite repository layer
 │   ├── shared/                 # NBA mappings, time utils, math
-│   └── strategies/             # Strategy modules
-├── polymarket_collector/       # Standalone user data collector
-├── scripts/                    # Docker entrypoints & EC2 setup
+│   ├── strategies/
+│   │   ├── lag/                # Lag arbitrage strategy
+│   │   └── rebalance/          # Rebalance strategy
+│   └── config.py
+├── scripts/                    # Execution entrypoints
+│   ├── run_lag.py              # Lag monitor runner
+│   ├── run_rebalance.py        # Rebalance monitor runner
+│   └── setup_ec2.sh            # EC2 initial setup
+├── tools/                      # Standalone analysis tools
+│   ├── collector/              # Polymarket user data collector
+│   ├── backtest/               # Historical backtesting scripts
+│   ├── analyze_wallet.py
+│   ├── arb_scanner.py
+│   └── ...
 ├── tests/                      # Test suite
 ├── docker-compose.yml          # Docker services
 ├── Dockerfile
@@ -107,15 +107,11 @@ cp .env.example .env
 ### Run
 
 ```bash
-# WebSocket mode (recommended)
-cd monitor
-python snapshot.py --ws
+# Lag monitor — WebSocket mode (recommended)
+PYTHONPATH=. python scripts/run_lag.py --ws
 
-# REST polling mode
-python snapshot.py
-
-# Generate report
-python report.py
+# Rebalance monitor
+PYTHONPATH=. python scripts/run_rebalance.py
 ```
 
 ### Docker (EC2 Deployment)
