@@ -500,18 +500,25 @@ class LagMonitor:
             """Direct book lookup by token_id."""
             return book_cache.get(token_id, (None, None))
 
+        # Commence time cache for game state filtering
+        commence_cache: dict[str, str] = {}  # game_id -> commence_time ISO string
+
+        def get_commence_time(game_id: str) -> str | None:
+            return commence_cache.get(game_id)
+
         paper_trading = PaperTradingEngine(
             repo=paper_repo,
             price_getter=get_poly_price,
             book_getter=get_poly_book,
             token_price_getter=get_token_price,
             token_book_getter=get_token_book,
+            commence_getter=get_commence_time,
             gap_threshold=0.04,
             hold_seconds=30,
             fee_rate=0.02,
             max_positions=10,
         )
-        print(f"Paper Trading: ENABLED (gap>=4%p, hold=30s, fee=2%)")
+        print(f"Paper Trading: ENABLED (gap>=4%p, hold=30s, fee=2%, game_state_filter=ON)")
 
         hi_res_capture.set_price_getter(get_poly_price)
         hi_res_capture.set_orderbook_getter(lambda *a: (None, None, None))
@@ -664,6 +671,14 @@ class LagMonitor:
                 print(f"  [ERROR] {e}")
                 return
 
+            # Load commence times for game state filtering
+            rows = self.conn.execute(
+                "SELECT odds_api_id, commence_time FROM game_mapping WHERE commence_time IS NOT NULL"
+            ).fetchall()
+            for r in rows:
+                commence_cache[r[0]] = r[1]
+            print(f"  {len(commence_cache)} commence times loaded for game state filter")
+
             # Pre-load h2h oracle data for paper trading AND add to game_mapping
             print("[Init] Fetching h2h oracle data for paper trading...")
             try:
@@ -681,6 +696,10 @@ class LagMonitor:
                     if not existing_slug:
                         self.game_repo.upsert(game_id, home, away, commence)
                         h2h_games_added += 1
+
+                    # Update commence cache
+                    if commence:
+                        commence_cache[game_id] = commence
 
                     for bm in game.get("bookmakers", []):
                         if bm["key"] != "pinnacle":

@@ -4,8 +4,11 @@ from __future__ import annotations
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Callable, Optional
+
+# NBA games typically last ~2.5 hours. Block trades after this window.
+MAX_GAME_DURATION_MINUTES = 150
 
 from src.db.paper_trades_repo import PaperTradesRepo
 from src.shared.time_utils import now_et_str
@@ -39,6 +42,7 @@ class PaperTradingEngine:
         book_getter: Callable[[str, str, str], tuple[Optional[float], Optional[float]]],
         token_price_getter: Optional[Callable[[str], Optional[float]]] = None,
         token_book_getter: Optional[Callable[[str], tuple[Optional[float], Optional[float]]]] = None,
+        commence_getter: Optional[Callable[[str], Optional[str]]] = None,
         gap_threshold: float = 0.04,
         hold_seconds: int = 30,
         fee_rate: float = 0.02,
@@ -52,6 +56,7 @@ class PaperTradingEngine:
             book_getter: (game_id, market_type, outcome) -> (bid, ask)
             token_price_getter: (token_id) -> price (direct lookup)
             token_book_getter: (token_id) -> (bid, ask) (direct lookup)
+            commence_getter: (game_id) -> commence_time ISO string
             gap_threshold: Minimum gap to enter (default 4%p)
             hold_seconds: Seconds to hold position (default 30)
             fee_rate: Fee rate to deduct from PnL (default 2%)
@@ -63,6 +68,7 @@ class PaperTradingEngine:
         self.book_getter = book_getter
         self.token_price_getter = token_price_getter
         self.token_book_getter = token_book_getter
+        self.commence_getter = commence_getter
         self.gap_threshold = gap_threshold
         self.hold_seconds = hold_seconds
         self.fee_rate = fee_rate
@@ -107,6 +113,23 @@ class PaperTradingEngine:
         if market_type != "moneyline":
             self.stats["skipped"] += 1
             return None
+
+        # Check game state: block trades on finished/late-game markets
+        if self.commence_getter:
+            commence_str = self.commence_getter(game_id)
+            if commence_str:
+                try:
+                    commence_dt = datetime.fromisoformat(commence_str.replace("Z", "+00:00"))
+                    now_utc = datetime.now(timezone.utc)
+                    elapsed = now_utc - commence_dt
+                    if elapsed > timedelta(minutes=MAX_GAME_DURATION_MINUTES):
+                        self.stats["skipped"] += 1
+                        mins = int(elapsed.total_seconds() / 60)
+                        print(f"  [Paper] SKIP {outcome}: game likely over "
+                              f"(started {mins}min ago, limit={MAX_GAME_DURATION_MINUTES}min)")
+                        return None
+                except (ValueError, TypeError):
+                    pass  # Unparseable commence_time, allow trade
 
         # Check cooldown
         key = f"{game_id}:{outcome}"
